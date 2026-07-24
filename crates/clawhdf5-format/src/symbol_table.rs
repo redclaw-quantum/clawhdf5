@@ -80,9 +80,12 @@ impl SymbolTableNode {
         offset_size: u8,
     ) -> Result<SymbolTableNode, FormatError> {
         // signature(4) + version(1) + reserved(1) + number_of_symbols(2) = 8
-        if offset + 8 > file_data.len() {
+        // `offset` comes from an untrusted file address field; use checked_add
+        // so a crafted near-usize::MAX value can't overflow this addition
+        // instead of failing the bounds check cleanly.
+        if offset.checked_add(8).is_none_or(|end| end > file_data.len()) {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + 8,
+                expected: offset.saturating_add(8),
                 available: file_data.len(),
             });
         }

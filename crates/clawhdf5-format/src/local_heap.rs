@@ -47,9 +47,15 @@ impl LocalHeap {
         let ls = length_size as usize;
         let os = offset_size as usize;
         let total = 8 + ls * 2 + os;
-        if offset + total > file_data.len() {
+        // `offset` comes from an untrusted file address field; use checked_add
+        // so a crafted near-usize::MAX value can't overflow this addition
+        // instead of failing the bounds check cleanly.
+        if offset
+            .checked_add(total)
+            .is_none_or(|end| end > file_data.len())
+        {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + total,
+                expected: offset.saturating_add(total),
                 available: file_data.len(),
             });
         }

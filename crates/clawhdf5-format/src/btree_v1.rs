@@ -65,9 +65,16 @@ impl BTreeV1Node {
         // + left_sibling(offset_size) + right_sibling(offset_size)
         let os = offset_size as usize;
         let header_size = 8 + os * 2;
-        if offset + header_size > file_data.len() {
+        // `offset` originates from an untrusted file address field; a crafted
+        // near-usize::MAX value must not be allowed to overflow this addition
+        // (which would wrap in release builds and spuriously pass the bounds
+        // check, or panic in debug builds).
+        if offset
+            .checked_add(header_size)
+            .is_none_or(|end| end > file_data.len())
+        {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + header_size,
+                expected: offset.saturating_add(header_size),
                 available: file_data.len(),
             });
         }

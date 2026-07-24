@@ -139,6 +139,17 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     })
 }
 
+/// Maximum recursion depth for B-tree v1 chunk-index traversal (malformed/
+/// adversarial data protection — see `btree_v1::MAX_BTREE_DEPTH`, the same
+/// guard applied to the structurally identical group B-tree traversal).
+///
+/// Without this guard, a crafted internal node whose child address points
+/// back at itself (or a short cycle between two internal nodes) makes this
+/// recurse forever, exhausting the call stack and aborting the process — an
+/// unrecoverable crash reachable from an ordinary read of a crafted chunked
+/// dataset, not a catchable `Result::Err`.
+const MAX_CHUNK_BTREE_DEPTH: usize = 64;
+
 /// Traverse B-tree v1 type 1 to collect all chunk locations.
 ///
 /// `ndims` is the number of offset dimensions in each key, which equals
@@ -148,16 +159,36 @@ pub fn collect_chunk_info(
     btree_address: u64,
     ndims: usize,
     offset_size: u8,
-    _length_size: u8,
+    length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
+    collect_chunk_info_inner(file_data, btree_address, ndims, offset_size, length_size, 0)
+}
+
+fn collect_chunk_info_inner(
+    file_data: &[u8],
+    btree_address: u64,
+    ndims: usize,
+    offset_size: u8,
+    _length_size: u8,
+    depth: usize,
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    if depth > MAX_CHUNK_BTREE_DEPTH {
+        return Err(FormatError::NestingDepthExceeded);
+    }
+
     let offset = btree_address as usize;
     let os = offset_size as usize;
 
-    // Parse B-tree v1 header
+    // Parse B-tree v1 header. `offset` comes from an untrusted file address
+    // field; use checked_add so a crafted near-usize::MAX value can't
+    // overflow this addition instead of failing the bounds check cleanly.
     let header_size = 8 + os * 2;
-    if offset + header_size > file_data.len() {
+    if offset
+        .checked_add(header_size)
+        .is_none_or(|end| end > file_data.len())
+    {
         return Err(FormatError::UnexpectedEof {
-            expected: offset + header_size,
+            expected: offset.saturating_add(header_size),
             available: file_data.len(),
         });
     }
@@ -246,8 +277,14 @@ pub fn collect_chunk_info(
 
         let mut all_chunks = Vec::new();
         for child_addr in child_addrs {
-            let child_chunks =
-                collect_chunk_info(file_data, child_addr, ndims, offset_size, _length_size)?;
+            let child_chunks = collect_chunk_info_inner(
+                file_data,
+                child_addr,
+                ndims,
+                offset_size,
+                _length_size,
+                depth + 1,
+            )?;
             all_chunks.extend(child_chunks);
         }
         Ok(all_chunks)
@@ -2085,5 +2122,62 @@ mod tests {
         let stats = cache.access_stats();
         // We accessed 2 chunks; the second should be sequential to the first
         assert!(stats.sequential_count > 0 || stats.random_count > 0);
+    }
+
+    /// Build a B-tree v1 type 1 internal node whose single child address
+    /// points back at `self_addr` (or any attacker-chosen address, for a
+    /// longer cycle) -- used to prove the recursion-depth guard rejects a
+    /// self-referencing/cyclic chunk index instead of overflowing the stack.
+    fn build_self_referencing_internal_node(
+        self_addr: u64,
+        ndims: usize,
+        offset_size: u8,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"TREE");
+        buf.push(1); // node_type = 1 (raw data chunks)
+        buf.push(1); // node_level = 1 (internal)
+        buf.extend_from_slice(&1u16.to_le_bytes()); // entries_used = 1
+
+        let undef: u64 = if offset_size == 4 {
+            0xFFFFFFFF
+        } else {
+            0xFFFFFFFFFFFFFFFF
+        };
+        write_offset(&mut buf, undef, offset_size);
+        write_offset(&mut buf, undef, offset_size);
+
+        // One key + one child address (the self-reference).
+        buf.extend_from_slice(&0u32.to_le_bytes()); // chunk_size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // filter_mask
+        for _ in 0..ndims {
+            write_offset(&mut buf, 0, offset_size);
+        }
+        write_offset(&mut buf, self_addr, offset_size);
+
+        // Final key (dummy)
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        for _ in 0..ndims {
+            write_offset(&mut buf, u64::MAX, offset_size);
+        }
+
+        buf
+    }
+
+    #[test]
+    fn self_referencing_internal_node_is_rejected_not_stack_overflowed() {
+        // A crafted internal node whose child address points back at itself
+        // must be rejected with NestingDepthExceeded, not recurse until the
+        // process's stack overflows.
+        let ndims = 2;
+        let os: u8 = 8;
+        let file_data = build_self_referencing_internal_node(0, ndims, os);
+
+        let result = collect_chunk_info(&file_data, 0, ndims, os, os);
+        assert!(
+            matches!(result, Err(FormatError::NestingDepthExceeded)),
+            "expected NestingDepthExceeded for a self-referencing node, got {result:?}"
+        );
     }
 }

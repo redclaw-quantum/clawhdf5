@@ -481,7 +481,15 @@ impl FractalHeapHeader {
         if row <= 1 {
             sbs
         } else {
-            sbs * (1u64 << (row - 1))
+            // `row` ultimately derives from `current_rows_in_root_indirect_block`,
+            // a raw u16 read straight from the file header with no upper-bound
+            // validation, so `row - 1` can reach/exceed 64 and overflow this
+            // shift (panics in debug builds, silently masks the shift amount in
+            // release). Saturate to a degenerate-but-safe value instead:
+            // downstream bounds checks reject an absurdly large block size
+            // cleanly, rather than the shift or multiplication panicking here.
+            let shifted = 1u64.checked_shl((row - 1) as u32).unwrap_or(u64::MAX);
+            sbs.saturating_mul(shifted)
         }
     }
 
@@ -490,7 +498,7 @@ impl FractalHeapHeader {
         let tw = self.table_width as u64;
         let mut total = 0u64;
         for row in 0..nrows {
-            total += self.block_size_for_row(row) * tw;
+            total = total.saturating_add(self.block_size_for_row(row).saturating_mul(tw));
         }
         total
     }
@@ -709,5 +717,34 @@ mod tests {
         let id = vec![0x40u8, 0, 0, 0, 0, 0, 0]; // bit 6 set = type 1
         let err = hdr.decode_managed_id(&id).unwrap_err();
         assert_eq!(err, FormatError::InvalidHeapIdType(1));
+    }
+
+    #[test]
+    fn block_size_for_row_saturates_instead_of_overflowing_shift() {
+        // `current_rows_in_root_indirect_block` is a raw u16 read straight
+        // from the file header with no upper-bound validation, so a crafted
+        // value >= 66 makes `row - 1 >= 64`, overflowing the
+        // `1u64 << (row - 1)` shift. Must saturate to a degenerate-but-safe
+        // value, not panic.
+        let header = FractalHeapHeader {
+            heap_id_length: 7,
+            io_filter_encoded_length: 0,
+            max_managed_object_size: 64,
+            table_width: 4,
+            starting_block_size: 512,
+            max_direct_block_size: 1 << 16,
+            max_heap_size: 32,
+            starting_row_of_indirect_blocks: 1,
+            root_block_address: 0,
+            current_rows_in_root_indirect_block: 100, // attacker-controlled
+            managed_objects_count: 0,
+        };
+
+        // Row 65 -> shift amount 64, out of range for a u64 -- must saturate.
+        assert_eq!(header.block_size_for_row(65), u64::MAX);
+
+        // The aggregate over many such rows must not panic/overflow either.
+        let total = header.indirect_block_heap_size(100);
+        assert_eq!(total, u64::MAX);
     }
 }

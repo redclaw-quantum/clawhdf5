@@ -547,24 +547,65 @@ pub fn build_fixed_array_at(
         _ => fadb.extend_from_slice(&fa_base_address.to_le_bytes()),
     }
 
-    // Element data
-    for chunk in chunks {
+    let write_element = |buf: &mut Vec<u8>, chunk: &WrittenChunk| {
         match offset_size {
-            4 => fadb.extend_from_slice(&(chunk.address as u32).to_le_bytes()),
-            8 => fadb.extend_from_slice(&chunk.address.to_le_bytes()),
-            _ => fadb.extend_from_slice(&chunk.address.to_le_bytes()),
+            4 => buf.extend_from_slice(&(chunk.address as u32).to_le_bytes()),
+            8 => buf.extend_from_slice(&chunk.address.to_le_bytes()),
+            _ => buf.extend_from_slice(&chunk.address.to_le_bytes()),
         }
         if has_filters {
             // Write compressed size using chunk_size_bytes (variable width)
             let cs_bytes = chunk.compressed_size.to_le_bytes();
-            fadb.extend_from_slice(&cs_bytes[..chunk_size_bytes]);
-            fadb.extend_from_slice(&chunk.filter_mask.to_le_bytes());
+            buf.extend_from_slice(&cs_bytes[..chunk_size_bytes]);
+            buf.extend_from_slice(&chunk.filter_mask.to_le_bytes());
+        }
+    };
+
+    // A data block is paged once it holds more elements than fit in one page
+    // (`page_nelmts = 1 << max_bits`) — must match the reader's `is_paged`
+    // check in `fixed_array::read_fixed_array_chunks`, or every chunk address
+    // beyond the page boundary reads back as garbage.
+    let page_nelmts = 1usize << max_bits;
+    let is_paged = num_elements > page_nelmts;
+
+    if !is_paged {
+        // Non-paged: elements packed directly, then a trailing checksum.
+        for chunk in chunks {
+            write_element(&mut fadb, chunk);
+        }
+        let fadb_checksum = jenkins_lookup3(&fadb);
+        fadb.extend_from_slice(&fadb_checksum.to_le_bytes());
+    } else {
+        // Paged: a page-init bitmap (one bit per page, MSB-first within each
+        // byte) + its checksum, then full-size page slots (`page_nelmts`
+        // elements + a 4-byte checksum each); only the last page's tail is
+        // padding. Every chunk is allocated here, so every bit is set.
+        let npages = num_elements.div_ceil(page_nelmts);
+        let bitmap_size = npages.div_ceil(8);
+        let mut bitmap = vec![0u8; bitmap_size];
+        for p in 0..npages {
+            bitmap[p / 8] |= 1u8 << (7 - (p % 8));
+        }
+        fadb.extend_from_slice(&bitmap);
+        let bitmap_checksum = jenkins_lookup3(&bitmap);
+        fadb.extend_from_slice(&bitmap_checksum.to_le_bytes());
+
+        for p in 0..npages {
+            let page_first = p * page_nelmts;
+            let page_count = core::cmp::min(page_nelmts, num_elements - page_first);
+            let mut page_buf = Vec::with_capacity(page_nelmts * elem_size);
+            for chunk in &chunks[page_first..page_first + page_count] {
+                write_element(&mut page_buf, chunk);
+            }
+            // Pad the final, short page's unused slots with zero bytes — the
+            // slot is always full-size on disk; the bitmap (not slot length)
+            // tells the reader how many elements in it are valid.
+            page_buf.resize(page_nelmts * elem_size, 0);
+            let page_checksum = jenkins_lookup3(&page_buf);
+            fadb.extend_from_slice(&page_buf);
+            fadb.extend_from_slice(&page_checksum.to_le_bytes());
         }
     }
-
-    // FADB checksum
-    let fadb_checksum = jenkins_lookup3(&fadb);
-    fadb.extend_from_slice(&fadb_checksum.to_le_bytes());
 
     let mut combined = fahd;
     combined.extend_from_slice(&fadb);
@@ -1309,6 +1350,55 @@ mod tests {
         // FAHD size = 4+1+1+1+1+8+8+4 = 28
         // FADB starts at offset 28
         assert_eq!(&fa[28..32], b"FADB");
+    }
+
+    /// Regression test: a Fixed Array with more elements than fit in one
+    /// page (`max_nelmts_bits=10` => 1024) must be written in the reader's
+    /// paged layout (bitmap + per-page checksummed slots), not the flat
+    /// layout. Previously `build_fixed_array_at` always wrote the flat
+    /// layout, so `read_fixed_array_chunks` (which switches to paged
+    /// parsing once `num_elements > 1024`) read back corrupted addresses
+    /// for any dataset with more than 1024 chunks.
+    #[test]
+    fn build_fixed_array_paged_roundtrip() {
+        const NUM_ELEMENTS: usize = 2500; // > 1024 => 3 pages (1024, 1024, 452)
+        let chunks: Vec<WrittenChunk> = (0..NUM_ELEMENTS)
+            .map(|i| WrittenChunk {
+                address: 0x1_0000 + (i as u64) * 0x100,
+                compressed_size: 0x100,
+                raw_size: 0x100,
+                filter_mask: 0,
+            })
+            .collect();
+
+        let fa_base = 0x2000u64;
+        let fa_bytes = build_fixed_array_at(&chunks, 8, 8, false, fa_base);
+
+        let mut file_data = vec![0u8; fa_base as usize + fa_bytes.len()];
+        file_data[fa_base as usize..].copy_from_slice(&fa_bytes);
+
+        let header =
+            crate::fixed_array::FixedArrayHeader::parse(&file_data, fa_base as usize, 8, 8)
+                .unwrap();
+        assert_eq!(header.num_elements, NUM_ELEMENTS as u64);
+
+        let ds_dims = vec![NUM_ELEMENTS as u64 * 20];
+        let chunk_dims = vec![20u32];
+        let read_chunks = crate::fixed_array::read_fixed_array_chunks(
+            &file_data,
+            &header,
+            &ds_dims,
+            &chunk_dims,
+            8,
+            8,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(read_chunks.len(), NUM_ELEMENTS);
+        for (i, rc) in read_chunks.iter().enumerate() {
+            assert_eq!(rc.address, chunks[i].address, "chunk {i} address mismatch");
+        }
     }
 
     // ---- Extensible Array tests ----

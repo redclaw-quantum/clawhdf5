@@ -207,9 +207,9 @@ fn scaleoffset_decompress(
                 if has_fill_code && code == fill_code {
                     fill_value
                 } else if is_escale {
-                    minval + code as f64 * 2f64.powi(scale_factor)
+                    minval + code as f64 * powi_bounded(2.0, scale_factor)
                 } else {
-                    minval + code as f64 / 10f64.powi(scale_factor)
+                    minval + code as f64 / powi_bounded(10.0, scale_factor)
                 }
             })
             .collect();
@@ -235,6 +235,25 @@ fn scaleoffset_decompress(
             .collect();
         Ok(write_elements(&values, elem_size, big_endian))
     }
+}
+
+/// Integer power for scale-offset decoding (D-scale base 10, E-scale base 2).
+///
+/// `f64::powi` lives in `std`, not `core`, so this crate computes it by
+/// repeated multiplication to stay `no_std`-clean.
+///
+/// The exponent comes from the file's filter client data and is therefore
+/// attacker-controlled: the loop exits as soon as the accumulator saturates
+/// to infinity, so a hostile exponent cannot buy unbounded work.
+fn powi_bounded(base: f64, exp: i32) -> f64 {
+    let mut result = 1.0f64;
+    for _ in 0..exp.unsigned_abs() {
+        result *= base;
+        if result.is_infinite() {
+            break;
+        }
+    }
+    if exp < 0 { 1.0 / result } else { result }
 }
 
 /// Read a little-endian float of `size` bytes (4 = f32, otherwise f64) as f64.

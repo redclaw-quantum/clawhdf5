@@ -649,7 +649,7 @@ pub fn precompress_chunks(
 
     let chunks = raw_chunks
         .into_iter()
-        .zip(compressed.into_iter())
+        .zip(compressed)
         .map(|((_offsets, raw_bytes), c)| (raw_bytes.len() as u64, c))
         .collect();
 

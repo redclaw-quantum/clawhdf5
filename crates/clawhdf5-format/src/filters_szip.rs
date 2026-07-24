@@ -2,6 +2,12 @@
 //!
 //! Gated by the `szip` feature which links against the system libaec library.
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::error::FormatError;
 
 /// Decompress SZIP-compressed data using libaec.
